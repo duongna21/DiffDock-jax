@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 import pytest
 import jax
-from batchnorm_flax import BatchNorm
+from models.batchnorm_flax import BatchNorm
 import e3nn_jax as e3nn
 from e3nn_jax.utils import assert_equivariant
 
