@@ -68,14 +68,15 @@ class FullTensorProduct(nn.Module):
     irreps_in1: Optional[e3nn.Irreps] = None
     irreps_in2: Optional[e3nn.Irreps] = None
 
-    def setup(self):
-        self.irreps_out = e3nn.Irreps(self.irreps_out)
-        self.irreps_in1 = e3nn.Irreps(self.irreps_in1) if self.irreps_in1 is not None else None
-        self.irreps_in2 = e3nn.Irreps(self.irreps_in2) if self.irreps_in2 is not None else None
-
+    @nn.compact
     def __call__(
         self, x1: e3nn.IrrepsArray, x2: e3nn.IrrepsArray, **kwargs
     ) -> e3nn.IrrepsArray:
+        
+        irreps_out = e3nn.Irreps(self.irreps_out)
+        irreps_in1 = e3nn.Irreps(self.irreps_in1) if self.irreps_in1 is not None else None
+        irreps_in2 = e3nn.Irreps(self.irreps_in2) if self.irreps_in2 is not None else None
+        
         x1 = e3nn.as_irreps_array(x1)
         x2 = e3nn.as_irreps_array(x2)
 
@@ -84,15 +85,15 @@ class FullTensorProduct(nn.Module):
         x2 = x2.broadcast_to(leading_shape + (-1,))
 
         if self.irreps_in1 is not None:
-            x1 = x1.rechunk(self.irreps_in1)
+            x1 = x1.rechunk(irreps_in1)
         if self.irreps_in2 is not None:
-            x2 = x2.rechunk(self.irreps_in2)
+            x2 = x2.rechunk(irreps_in2)
 
         x1 = x1.remove_zero_chunks().simplify()
         x2 = x2.remove_zero_chunks().simplify()
 
         tp = FunctionalFullTensorProduct(
-            x1.irreps, x2.irreps, self.irreps_out.simplify()
+            x1.irreps, x2.irreps, irreps_out.simplify()
         )
         ws = [
             self.param(
@@ -112,4 +113,4 @@ class FullTensorProduct(nn.Module):
             f = e3nn.utils.vmap(f)
 
         output = f(x1, x2)
-        return output.rechunk(self.irreps_out)
+        return output.rechunk(irreps_out)

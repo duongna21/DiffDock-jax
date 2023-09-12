@@ -1,11 +1,11 @@
 import math
-from typing import Optional, Any
+from typing import Optional, Any, Callable
 
 import e3nn_jax as e3nn
 import jax
 import flax.linen as nn
-# from torch_cluster import radius, radius_graph
-from utils.scatter import scatter, scatter_mean
+from utils.radius import radius, radius_graph
+from utils.scatter import scatter
 import numpy as np
 import jax.numpy as jnp
 from batchnorm_flax import BatchNorm
@@ -63,7 +63,7 @@ class AtomEncoder(nn.Module):
             assert x.shape[1] == self.num_categorical_features + self.num_scalar_features
             
         for i, emb in enumerate(self.atom_embedding_list):
-            x_embedding += emb(x[:, i].astype(jnp.int32))
+            x_embedding += emb(x[:, i])
 
         if self.num_scalar_features > 0:
             x_embedding += self.linear(x[:, self.num_categorical_features:self.num_categorical_features + self.num_scalar_features])
@@ -104,7 +104,7 @@ class TensorProductConvLayer(nn.Module):
         
         if self.residual:
             # padded = F.pad(node_attr, (0, out.shape[-1] - node_attr.shape[-1]))
-            padded = jnp.pad(node_attr, (0, out.shape[-1] - node_attr.shape[-1]), mode='constant') #TODO check for similarity
+            padded = jnp.pad(node_attr, ((0,0),(0, out.shape[-1] - node_attr.shape[-1])), mode='constant')
             out = out + padded
 
         if self.batch_norm:
@@ -113,8 +113,8 @@ class TensorProductConvLayer(nn.Module):
 
 
 class DiffDock(nn.Module):
-    t_to_sigma: Any
-    timestep_emb_func: Any
+    t_to_sigma: Callable
+    timestep_emb_func: Callable
     in_lig_edge_features: int = 4 
     sigma_embed_dim: int = 32
     sh_lmax: int = 2
@@ -248,20 +248,201 @@ class DiffDock(nn.Module):
                                                     nn.Dropout(self.dropout),
                                                     nn.Dense(1, use_bias=False)])
             
-    def __call__(self, input):
-        pass
+    def __call__(self, inputs):
+        if not False:
+            tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(*[inputs.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']])
+        else:
+            tr_sigma, rot_sigma, tor_sigma = [inputs.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']]
 
-    def build_lig_conv_graph(self, input):
-        pass
+        # build ligand graph
+        lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh = self.build_lig_conv_graph(inputs)
+        lig_src, lig_dst = lig_edge_index
+        lig_node_attr = self.lig_node_embedding(lig_node_attr)
+        lig_edge_attr = self.lig_edge_embedding(lig_edge_attr)
 
-    def build_rec_conv_graph(self, input):
-        pass
+        # build receptor graph
+        rec_node_attr, rec_edge_index, rec_edge_attr, rec_edge_sh = self.build_rec_conv_graph(inputs)
+        rec_src, rec_dst = rec_edge_index
+        rec_node_attr = self.rec_node_embedding(rec_node_attr)
+        rec_edge_attr = self.rec_edge_embedding(rec_edge_attr)
+
+        # build cross graph
+        if self.dynamic_max_cross:
+            cross_cutoff = (tr_sigma * 3 + 20)[:, None]
+        else:
+            cross_cutoff = self.cross_max_distance
+        cross_edge_index, cross_edge_attr, cross_edge_sh = self.build_cross_conv_graph(inputs, cross_cutoff)
+        cross_lig, cross_rec = cross_edge_index
+        cross_edge_attr = self.cross_edge_embedding(cross_edge_attr)
+
+        for l in range(len(self.lig_conv_layers)):
+            lig_edge_attr_ = jnp.concatenate([lig_edge_attr, lig_node_attr[lig_src, :self.ns], lig_node_attr[lig_dst, :self.ns]], axis=-1)
+            lig_intra_update = self.lig_conv_layers[l](lig_node_attr, lig_edge_index, lig_edge_attr_, lig_edge_sh)
+
+            # inter graph message passing
+            rec_to_lig_edge_attr_ = jnp.concatenate([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], axis=-1)
+            lig_inter_update = self.rec_to_lig_conv_layers[l](rec_node_attr, cross_edge_index, rec_to_lig_edge_attr_, cross_edge_sh,
+                                                              out_nodes=lig_node_attr.shape[0])
+
+            if l != len(self.lig_conv_layers) - 1:
+                rec_edge_attr_ = jnp.concatenate([rec_edge_attr, rec_node_attr[rec_src, :self.ns], rec_node_attr[rec_dst, :self.ns]], -1)
+                rec_intra_update = self.rec_conv_layers[l](rec_node_attr, rec_edge_index, rec_edge_attr_, rec_edge_sh)
+
+                lig_to_rec_edge_attr_ = jnp.concatenate([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], axis=-1)
+                rec_inter_update = self.lig_to_rec_conv_layers[l](lig_node_attr, jnp.flip(cross_edge_index, dims=[0]), lig_to_rec_edge_attr_,
+                                                                  cross_edge_sh, out_nodes=rec_node_attr.shape[0])
+                
+            # padding original features
+            lig_node_attr = jnp.pad(lig_node_attr, ((0,0),(0, lig_intra_update.shape[-1] - lig_node_attr.shape[-1]))) 
+
+            # update features with residual updates
+            lig_node_attr = lig_node_attr + lig_intra_update + lig_inter_update
+
+            if l != len(self.lig_conv_layers) - 1:
+                rec_node_attr = jnp.pad(rec_node_attr, ((0,0),(0, rec_intra_update.shape[-1] - rec_node_attr.shape[-1])))
+                rec_node_attr = rec_node_attr + rec_intra_update + rec_inter_update
+        
+        # compute translational and rotational score vectors
+        center_edge_index, center_edge_attr, center_edge_sh = self.build_center_conv_graph(inputs)
+        center_edge_attr = self.center_edge_embedding(center_edge_attr)
+        center_edge_attr = jnp.concatenate([center_edge_attr, lig_node_attr[center_edge_index[1], :self.ns]], -1)
+        global_pred = self.final_conv(lig_node_attr, center_edge_index, center_edge_attr, center_edge_sh, out_nodes=inputs.num_graphs)
+
+        tr_pred = global_pred[:, :3] + global_pred[:, 6:9]
+        rot_pred = global_pred[:, 3:6] + global_pred[:, 9:]
+        inputs.graph_sigma_emb = self.timestep_emb_func(inputs.complex_t['tr'])
+
+        # fix the magnitude of translational and rotational score vectors
+        tr_norm = jnp.linalg.norm(tr_pred, axis=1, keepdims=True)
+        tr_pred = tr_pred / tr_norm * self.tr_final_layer(jnp.concatenate([tr_norm, inputs.graph_sigma_emb], axis=1))
+        rot_norm = jnp.linalg.norm(rot_pred, axis=1, keepdims=True)
+        rot_pred = rot_pred / rot_norm * self.rot_final_layer(jnp.concatenate([rot_norm, inputs.graph_sigma_emb], axis=1))
+
+        if self.scale_by_sigma:
+            tr_pred = tr_pred / tr_sigma[:, None]
+            rot_pred = rot_pred * so3.score_norm(rot_sigma)[:, None]
+
+        if self.no_torsion or jnp.sum(inputs['ligand'].edge_mask) == 0:
+            return tr_pred, rot_pred, jnp.empty((0,))
+
+        # torsional components
+        tor_bonds, tor_edge_index, tor_edge_attr, tor_edge_sh = self.build_bond_conv_graph(inputs)
+        tor_bond_vec = inputs['ligand'].pos[tor_bonds[1]] - inputs['ligand'].pos[tor_bonds[0]]
+        tor_bond_attr = lig_node_attr[tor_bonds[0]] + lig_node_attr[tor_bonds[1]]
+
+        tor_bonds_sh = e3nn.spherical_harmonics("2e", tor_bond_vec, normalize=True, normalization='component')
+        tor_edge_sh = self.final_tp_tor(tor_edge_sh, tor_bonds_sh[tor_edge_index[0]])
+        
+        tor_edge_attr = jnp.concatenate([tor_edge_attr, lig_node_attr[tor_edge_index[1], :self.ns], tor_bond_attr[tor_edge_index[0], :self.ns]], -1)
+        tor_pred = self.tor_bond_conv(lig_node_attr, tor_edge_index, tor_edge_attr, tor_edge_sh, out_nodes=jnp.sum(inputs['ligand'].edge_mask), reduce='mean')
+        tor_pred = self.tor_final_layer(tor_pred).squeeze(1)
+        edge_sigma = tor_sigma[inputs['ligand'].batch][inputs['ligand', 'ligand'].edge_index[0]][inputs['ligand'].edge_mask]
+
+        if self.scale_by_sigma:
+            tor_pred = tor_pred * jnp.sqrt(torus.score_norm(edge_sigma))
+
+        return tr_pred, rot_pred, tor_pred
+
+
+    def build_lig_conv_graph(self, inputs):
+        inputs['ligand'].node_sigma_emb = self.timestep_emb_func(inputs['ligand'].node_t['tr'])
+
+        # compute edges
+        # Note: You need a JAX implementation of the radius_graph function.
+        radius_edges = radius_graph(inputs['ligand'].pos, self.lig_max_radius, inputs['ligand'].batch)
+        edge_index = jnp.concatenate([inputs['ligand', 'ligand'].edge_index, radius_edges], axis=1)
+        edge_attr = jnp.concatenate([
+            inputs['ligand', 'ligand'].edge_attr,
+            jnp.zeros((radius_edges.shape[-1], self.in_lig_edge_features))
+        ], axis=0)
+
+        # compute initial features
+        # Note: The index-based selection might need further adjustments in JAX.
+        edge_sigma_emb = inputs['ligand'].node_sigma_emb[edge_index[0]]
+        edge_attr = jnp.concatenate([edge_attr, edge_sigma_emb], axis=1)
+        node_attr = jnp.concatenate([inputs['ligand'].x, inputs['ligand'].node_sigma_emb], axis=1)
+
+        src, dst = edge_index
+        edge_vec = inputs['ligand'].pos[dst] - inputs['ligand'].pos[src]
+        
+        # The following function `self.lig_distance_expansion` needs to be replaced or adapted for JAX.
+        edge_length_emb = self.lig_distance_expansion(jnp.linalg.norm(edge_vec, axis=-1))
+
+        edge_attr = jnp.concatenate([edge_attr, edge_length_emb], axis=1)
+        
+        edge_sh = e3nn.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+
+        return node_attr, edge_index, edge_attr, edge_sh
+
+    def build_rec_conv_graph(self, inputs):
+        inputs['receptor'].node_sigma_emb = self.timestep_emb_func(inputs['receptor'].node_t['tr']) # tr rot and tor noise is all the same
+        node_attr = jnp.concatenate([inputs['receptor'].x, inputs['receptor'].node_sigma_emb], 1)
+
+        # this assumes the edges were already created in preprocessing since protein's structure is fixed
+        edge_index = inputs['receptor', 'receptor'].edge_index
+        src, dst = edge_index
+        edge_vec = inputs['receptor'].pos[dst] - inputs['receptor'].pos[src]
+
+        edge_length_emb = self.rec_distance_expansion(edge_vec.norm(dim=-1))
+        edge_sigma_emb = inputs['receptor'].node_sigma_emb[edge_index[0]]
+        edge_attr = jnp.concatenate([edge_sigma_emb, edge_length_emb], axis=1)
+        edge_sh = e3nn.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+
+        return node_attr, edge_index, edge_attr, edge_sh   
+     
+    def build_cross_conv_graph(self, inputs, cross_distance_cutoff):
+        if isinstance(cross_distance_cutoff, jnp.ndarray):
+            # different cutoff for every graph (depends on the diffusion time)
+            edge_index = radius(inputs['receptor'].pos / cross_distance_cutoff[inputs['receptor'].batch],
+                                    inputs['ligand'].pos / cross_distance_cutoff[inputs['ligand'].batch], 1,
+                                    inputs['receptor'].batch, inputs['ligand'].batch, max_num_neighbors=10000)
+        else:
+            edge_index = radius(inputs['receptor'].pos, inputs['ligand'].pos, cross_distance_cutoff,
+                                    inputs['receptor'].batch, inputs['ligand'].batch, max_num_neighbors=10000)
+
+        src, dst = edge_index
+        edge_vec = inputs['receptor'].pos[dst] - inputs['ligand'].pos[src]
+        
+        edge_length_emb = self.cross_distance_expansion(jnp.linalg.norm(edge_vec, axis=-1))
+        
+        edge_sigma_emb = inputs['ligand'].node_sigma_emb[src]
+        edge_attr = jnp.concatenate([edge_sigma_emb, edge_length_emb], axis=1)
+        
+        edge_sh = e3nn.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+
+        return edge_index, edge_attr, edge_sh
     
-    def build_cross_conv_graph(self, input):
-        pass
+    def build_center_conv_graph(self, inputs):
+        # builds the filter and edges for the convolution generating translational and rotational scores
+        edge_index = jnp.concatenate([inputs['ligand'].batch[None, :], jnp.arange(len(inputs['ligand'].batch))[None, :]], axis=0)
+
+        center_pos = jnp.zeros((inputs.num_graphs, 3))
+        # center_pos.index_add_(0, index=data['ligand'].batch, source=data['ligand'].pos)
+        # center_pos = jnp.add.at(center_pos, inputs['ligand'].batch, inputs['ligand'].pos, inplace=False)
+        for i, idx in enumerate(inputs['ligand'].batch):
+            center_pos = center_pos.at[idx].add(inputs['ligand'].pos[i])
+            
+        center_pos = center_pos / jnp.bincount(inputs['ligand'].batch)[:, None]
+
+        edge_vec = inputs['ligand'].pos[edge_index[1]] - center_pos[edge_index[0]]
+        edge_attr = self.center_distance_expansion(jnp.linalg.norm(edge_vec, axis=-1))
+        edge_sigma_emb = inputs['ligand'].node_sigma_emb[edge_index[1]]
+        edge_attr = jnp.concatenate([edge_attr, edge_sigma_emb], axis=1)
+        edge_sh = e3nn.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+
+        return edge_index, edge_attr, edge_sh
     
-    def build_center_conv_graph(self, input):
-        pass
-    
-    def build_bond_conv_graph(self, input):
-        pass
+    def build_bond_conv_graph(self, inputs):
+        # builds the graph for the convolution between the center of the rotatable bonds and the neighbouring nodes
+        bonds = inputs['ligand', 'ligand'].edge_index[:, inputs['ligand'].edge_mask]
+        bond_pos = (inputs['ligand'].pos[bonds[0]] + inputs['ligand'].pos[bonds[1]]) / 2
+        bond_batch = inputs['ligand'].batch[bonds[0]]
+        edge_index = radius(inputs['ligand'].pos, bond_pos, self.lig_max_radius, batch_x=inputs['ligand'].batch, batch_y=bond_batch)
+
+        edge_vec = inputs['ligand'].pos[edge_index[1]] - bond_pos[edge_index[0]]
+        edge_attr = self.lig_distance_expansion(jnp.linalg.norm(edge_vec, axis=-1))
+        
+        edge_attr = self.final_edge_embedding(edge_attr)
+        edge_sh = e3nn.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
+
+        return bonds, edge_index, edge_attr, edge_sh

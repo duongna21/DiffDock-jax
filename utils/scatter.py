@@ -81,7 +81,6 @@ def scatter_mean(src: jnp.ndarray, index: jnp.ndarray, dim: int = -1,
         return jnp.true_divide(out, count)
     else:
         return jnp.floor(out / count)
-    # return out / count
 
 def scatter(src, index, dim=-1, out=None, dim_size=None, reduce="sum"):
     if reduce == 'sum' or reduce == 'add':

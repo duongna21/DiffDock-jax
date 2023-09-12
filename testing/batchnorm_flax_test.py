@@ -94,3 +94,5 @@ def test_normalization(keys, instance):
     assert (
         jnp.max(jnp.abs(jnp.square(a).mean(3).mean([0, 1]) - 1)) < sqrt_float_tolerance
     )
+    
+    

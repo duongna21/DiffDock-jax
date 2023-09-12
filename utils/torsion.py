@@ -1,5 +1,6 @@
 import jax.numpy as jnp
 from scipy.spatial.transform import Rotation as R
+import jax
 
 def modify_conformer_torsion_angles_jax(pos, edge_index, mask_rotate, torsion_updates, as_numpy=False):
     pos = jnp.array(pos)
