@@ -66,7 +66,6 @@ def p(x, sigma):
 def sample(sigma):
     seed = 0
     key = jax.random.PRNGKey(0)
-    print(sigma)
     out = sigma * jax.random.normal(key, sigma.shape)
     out = (out + jnp.pi) % (2 * jnp.pi) - jnp.pi
     return out
@@ -84,5 +83,3 @@ def score_norm(sigma):
     sigma = (sigma - jnp.log(SIGMA_MIN)) / (jnp.log(SIGMA_MAX) - jnp.log(SIGMA_MIN)) * SIGMA_N
     sigma = jnp.round(jnp.clip(sigma, 0, SIGMA_N)).astype(int)
     return score_norm_[sigma]
-
-print(jnp.pi)
