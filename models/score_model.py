@@ -30,6 +30,21 @@ class GaussianSmearing(nn.Module):
         return jnp.exp(self.coeff * jnp.power(dist, 2))
 
 
+class MLP(nn.Module):
+
+  hidden_size: int
+  output_size: int
+  dropout: float
+  bias: bool = True
+
+  @nn.compact
+  def __call__(self, inputs, training):
+    x = nn.Dense(self.hidden_size, use_bias=self.bias)(inputs)
+    x = nn.relu(x)
+    x = nn.Dropout(rate=self.dropout, deterministic=not training)(x)
+    x = nn.Dense(self.output_size, use_bias=self.bias)(x)
+    return x
+
 class AtomEncoder(nn.Module):
     emb_dim: int
     feature_dims: tuple
@@ -80,30 +95,27 @@ class TensorProductConvLayer(nn.Module):
     residual: bool = True
     batch_norm: bool = True
     dropout: float = 0.0
-    hidden_features: int = None
+    hidden_features: int = None    
     
     def setup(self):
         if self.hidden_features is None:
             self.hidden_features = self.n_edge_features
 
         self.tp = tp = FullyConnectedTensorProduct(self.in_irreps, self.sh_irreps, self.out_irreps)
-        self.fc = nn.Sequential([nn.Dense(features=self.hidden_features),
-                                nn.relu(),
-                                nn.Dropout(rate=self.dropout),
-                                nn.Dense(features=tp.weight_numel)])  #TODO int: weight_numel = sum(prod(ins.path_shape) for ins in self.instructions if ins.has_weight)
+        
+        self.mlp = MLP(self.hidden_features, tp.weight_numel, self.dropout)  #TODO int: weight_numel = sum(prod(ins.path_shape) for ins in self.instructions if ins.has_weight)
         
         self.batch_norm = BatchNorm(self.out_irreps) if self.batch_norm else None
-
-    def forward(self, node_attr, edge_index, edge_attr, edge_sh, out_nodes=None, reduce='mean'):
+        
+    def forward(self, node_attr, edge_index, edge_attr, edge_sh, out_nodes=None, reduce='mean', training=False):
 
         edge_src, edge_dst = edge_index
-        tp = self.tp(node_attr[edge_dst], edge_sh, self.fc(edge_attr))
+        tp = self.tp(node_attr[edge_dst], edge_sh, self.mlp(edge_attr, training))
 
         out_nodes = out_nodes or node_attr.shape[0]
         out = scatter(tp, edge_src, dim=0, dim_size=out_nodes, reduce=reduce)
         
         if self.residual:
-            # padded = F.pad(node_attr, (0, out.shape[-1] - node_attr.shape[-1]))
             padded = jnp.pad(node_attr, ((0,0),(0, out.shape[-1] - node_attr.shape[-1])), mode='constant')
             out = out + padded
 
@@ -137,24 +149,14 @@ class DiffDock(nn.Module):
     confidence_dropout: float = 0.0
     confidence_no_batchnorm: bool = False 
 
-
     def setup(self):
         self.sh_irreps = e3nn.Irreps.spherical_harmonics(lmax=self.sh_lmax)
         self.lig_node_embedding = AtomEncoder(emb_dim=self.ns, feature_dims=lig_feature_dims, sigma_embed_dim=self.sigma_embed_dim)
-        self.lig_edge_embedding = nn.Sequential([nn.Dense(self.ns),
-                                                nn.relu(),
-                                                nn.Dropout(self.dropout),
-                                                nn.Dense(self.ns)])
-
+        self.lig_edge_embedding = MLP(self.ns, self.ns, self.dropout)
+        
         self.rec_node_embedding = AtomEncoder(emb_dim=self.ns, feature_dims=rec_residue_feature_dims, sigma_embed_dim=self.sigma_embed_dim, lm_embedding_type=self.lm_embedding_type)
-        self.rec_edge_embedding = nn.Sequential([nn.Dense(self.ns),
-                                                nn.relu(),
-                                                nn.Dropout(self.dropout),
-                                                nn.Dense(self.ns)])
-        self.cross_edge_embedding = nn.Sequential([nn.Dense(self.ns),
-                                                    nn.relu(),
-                                                    nn.Dropout(self.dropout),
-                                                    nn.Dense(self.ns)])
+        self.rec_edge_embedding = MLP(self.ns, self.ns, self.dropout)
+        self.cross_edge_embedding = MLP(self.ns, self.ns, self.dropout)
         self.lig_distance_expansion = GaussianSmearing(0.0, self.lig_max_radius, self.distance_embed_dim)
         self.rec_distance_expansion = GaussianSmearing(0.0, self.rec_max_radius, self.distance_embed_dim)
         self.cross_distance_expansion = GaussianSmearing(0.0, self.cross_max_distance, self.cross_distance_embed_dim)
@@ -204,10 +206,7 @@ class DiffDock(nn.Module):
         self.rec_to_lig_conv_layers = rec_to_lig_conv_layers
         
         self.center_distance_expansion = GaussianSmearing(0.0, self.center_max_distance, self.distance_embed_dim)
-        self.center_edge_embedding = nn.Sequential([nn.Dense(self.ns),
-                                                    nn.relu(),
-                                                    nn.Dropout(self.dropout),
-                                                    nn.Dense(self.ns)])
+        self.center_edge_embedding = MLP(self.ns, self.ns, self.dropout)
 
         self.final_conv = TensorProductConvLayer(
             in_irreps=self.lig_conv_layers[-1].out_irreps,
@@ -218,21 +217,13 @@ class DiffDock(nn.Module):
             dropout=self.dropout,
             batch_norm=self.batch_norm
         )
-        self.tr_final_layer = nn.Sequential([nn.Dense(self.ns),
-                                            nn.Dropout(self.dropout), 
-                                            nn.relu(), 
-                                            nn.Dense(1)])
-        self.rot_final_layer = nn.Sequential([nn.Dense(self.ns),
-                                             nn.Dropout(self.dropout), 
-                                             nn.relu(), 
-                                             nn.Dense(1)])
+
+        self.tr_final_layer = MLP(self.ns, 1, self.dropout)
+        self.rot_final_layer = MLP(self.ns, 1, self.dropout)
 
         if not self.no_torsion:
             # torsion angles components
-            self.final_edge_embedding = nn.Sequential([nn.Dense(self.ns),
-                                                        nn.relu(),
-                                                        nn.Dropout(self.dropout),
-                                                        nn.Dense(self.ns)])
+            self.final_edge_embedding = MLP(self.ns, self.ns, self.dropout)
             self.final_tp_tor = FullTensorProduct(self.sh_irreps, "2e")
             self.tor_bond_conv = TensorProductConvLayer(
                 in_irreps=self.lig_conv_layers[-1].out_irreps,
@@ -243,12 +234,10 @@ class DiffDock(nn.Module):
                 dropout=self.dropout,
                 batch_norm=self.batch_norm
             )
-            self.tor_final_layer = nn.Sequential([nn.Dense(self.ns, use_bias=False),
-                                                    jnp.tanh(),
-                                                    nn.Dropout(self.dropout),
-                                                    nn.Dense(1, use_bias=False)])
+
+            self.tor_final_layer = MLP(self.ns, 1, self.dropout, False)
             
-    def __call__(self, inputs):
+    def __call__(self, inputs, training):
         if not False:
             tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(*[inputs.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']])
         else:
@@ -258,13 +247,13 @@ class DiffDock(nn.Module):
         lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh = self.build_lig_conv_graph(inputs)
         lig_src, lig_dst = lig_edge_index
         lig_node_attr = self.lig_node_embedding(lig_node_attr)
-        lig_edge_attr = self.lig_edge_embedding(lig_edge_attr)
+        lig_edge_attr = self.lig_edge_embedding(lig_edge_attr, training)
 
         # build receptor graph
         rec_node_attr, rec_edge_index, rec_edge_attr, rec_edge_sh = self.build_rec_conv_graph(inputs)
         rec_src, rec_dst = rec_edge_index
         rec_node_attr = self.rec_node_embedding(rec_node_attr)
-        rec_edge_attr = self.rec_edge_embedding(rec_edge_attr)
+        rec_edge_attr = self.rec_edge_embedding(rec_edge_attr, training)
 
         # build cross graph
         if self.dynamic_max_cross:
@@ -273,7 +262,7 @@ class DiffDock(nn.Module):
             cross_cutoff = self.cross_max_distance
         cross_edge_index, cross_edge_attr, cross_edge_sh = self.build_cross_conv_graph(inputs, cross_cutoff)
         cross_lig, cross_rec = cross_edge_index
-        cross_edge_attr = self.cross_edge_embedding(cross_edge_attr)
+        cross_edge_attr = self.cross_edge_embedding(cross_edge_attr, training)
 
         for l in range(len(self.lig_conv_layers)):
             lig_edge_attr_ = jnp.concatenate([lig_edge_attr, lig_node_attr[lig_src, :self.ns], lig_node_attr[lig_dst, :self.ns]], axis=-1)
@@ -304,7 +293,7 @@ class DiffDock(nn.Module):
         
         # compute translational and rotational score vectors
         center_edge_index, center_edge_attr, center_edge_sh = self.build_center_conv_graph(inputs)
-        center_edge_attr = self.center_edge_embedding(center_edge_attr)
+        center_edge_attr = self.center_edge_embedding(center_edge_attr, training)
         center_edge_attr = jnp.concatenate([center_edge_attr, lig_node_attr[center_edge_index[1], :self.ns]], -1)
         global_pred = self.final_conv(lig_node_attr, center_edge_index, center_edge_attr, center_edge_sh, out_nodes=inputs.num_graphs)
 
@@ -314,9 +303,9 @@ class DiffDock(nn.Module):
 
         # fix the magnitude of translational and rotational score vectors
         tr_norm = jnp.linalg.norm(tr_pred, axis=1, keepdims=True)
-        tr_pred = tr_pred / tr_norm * self.tr_final_layer(jnp.concatenate([tr_norm, inputs.graph_sigma_emb], axis=1))
+        tr_pred = tr_pred / tr_norm * self.tr_final_layer(jnp.concatenate([tr_norm, inputs.graph_sigma_emb], axis=1), training)
         rot_norm = jnp.linalg.norm(rot_pred, axis=1, keepdims=True)
-        rot_pred = rot_pred / rot_norm * self.rot_final_layer(jnp.concatenate([rot_norm, inputs.graph_sigma_emb], axis=1))
+        rot_pred = rot_pred / rot_norm * self.rot_final_layer(jnp.concatenate([rot_norm, inputs.graph_sigma_emb], axis=1), training)
 
         if self.scale_by_sigma:
             tr_pred = tr_pred / tr_sigma[:, None]
@@ -326,7 +315,7 @@ class DiffDock(nn.Module):
             return tr_pred, rot_pred, jnp.empty((0,))
 
         # torsional components
-        tor_bonds, tor_edge_index, tor_edge_attr, tor_edge_sh = self.build_bond_conv_graph(inputs)
+        tor_bonds, tor_edge_index, tor_edge_attr, tor_edge_sh = self.build_bond_conv_graph(inputs, training)
         tor_bond_vec = inputs['ligand'].pos[tor_bonds[1]] - inputs['ligand'].pos[tor_bonds[0]]
         tor_bond_attr = lig_node_attr[tor_bonds[0]] + lig_node_attr[tor_bonds[1]]
 
@@ -335,7 +324,7 @@ class DiffDock(nn.Module):
         
         tor_edge_attr = jnp.concatenate([tor_edge_attr, lig_node_attr[tor_edge_index[1], :self.ns], tor_bond_attr[tor_edge_index[0], :self.ns]], -1)
         tor_pred = self.tor_bond_conv(lig_node_attr, tor_edge_index, tor_edge_attr, tor_edge_sh, out_nodes=jnp.sum(inputs['ligand'].edge_mask), reduce='mean')
-        tor_pred = self.tor_final_layer(tor_pred).squeeze(1)
+        tor_pred = self.tor_final_layer(tor_pred, training).squeeze(1)
         edge_sigma = tor_sigma[inputs['ligand'].batch][inputs['ligand', 'ligand'].edge_index[0]][inputs['ligand'].edge_mask]
 
         if self.scale_by_sigma:
@@ -432,7 +421,7 @@ class DiffDock(nn.Module):
 
         return edge_index, edge_attr, edge_sh
     
-    def build_bond_conv_graph(self, inputs):
+    def build_bond_conv_graph(self, inputs, training):
         # builds the graph for the convolution between the center of the rotatable bonds and the neighbouring nodes
         bonds = inputs['ligand', 'ligand'].edge_index[:, inputs['ligand'].edge_mask]
         bond_pos = (inputs['ligand'].pos[bonds[0]] + inputs['ligand'].pos[bonds[1]]) / 2
@@ -442,7 +431,7 @@ class DiffDock(nn.Module):
         edge_vec = inputs['ligand'].pos[edge_index[1]] - bond_pos[edge_index[0]]
         edge_attr = self.lig_distance_expansion(jnp.linalg.norm(edge_vec, axis=-1))
         
-        edge_attr = self.final_edge_embedding(edge_attr)
+        edge_attr = self.final_edge_embedding(edge_attr, training)
         edge_sh = e3nn.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
 
         return bonds, edge_index, edge_attr, edge_sh
