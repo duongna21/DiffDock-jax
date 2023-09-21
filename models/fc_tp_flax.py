@@ -52,10 +52,6 @@ class FullyConnectedTensorProduct(nn.Module):
         ]
         f = lambda x1, x2: tp.left_right(ws, x1, x2, **kwargs)
         
-        weight_numel = sum(np.prod(ins.path_shape) for ins in tp.instructions if ins.has_weight)
-        
-        print(weight_numel)
-        
         for _ in range(len(leading_shape)):
             f = e3nn.utils.vmap(f)
 

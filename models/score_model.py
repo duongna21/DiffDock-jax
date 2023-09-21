@@ -8,9 +8,9 @@ from utils.radius import radius, radius_graph
 from utils.scatter import scatter
 import numpy as np
 import jax.numpy as jnp
-from batchnorm_flax import BatchNorm
-from f_tp_flax import FullTensorProduct
-from fc_tp_flax import FullyConnectedTensorProduct
+from models.batchnorm_flax import BatchNorm
+from models.f_tp_flax import FullTensorProduct
+from models.fc_tp_flax import FullyConnectedTensorProduct
 from utils import so3, torus
 from datasets.process_mols import lig_feature_dims, rec_residue_feature_dims
 
@@ -56,10 +56,7 @@ class AtomEncoder(nn.Module):
         self.atom_embedding_list = []
         self.num_categorical_features = len(self.feature_dims[0])
         self.num_scalar_features = self.feature_dims[1] + self.sigma_embed_dim
-        for _, dim in enumerate(self.feature_dims[0]):
-            emb = nn.Embed(num_embeddings=dim, features=self.emb_dim, embedding_init=jax.nn.initializers.glorot_uniform())
-            self.atom_embedding_list.append(emb)
-
+        self.atom_embedding_list = [nn.Embed(num_embeddings=dim, features=self.emb_dim, embedding_init=jax.nn.initializers.glorot_uniform()) for _, dim in enumerate(self.feature_dims[0])]
         if self.num_scalar_features > 0:
             self.linear = nn.Dense(self.emb_dim)
             
@@ -78,7 +75,7 @@ class AtomEncoder(nn.Module):
             assert x.shape[1] == self.num_categorical_features + self.num_scalar_features
             
         for i, emb in enumerate(self.atom_embedding_list):
-            x_embedding += emb(x[:, i])
+            x_embedding += emb(x[:, i].astype(jnp.int64))
 
         if self.num_scalar_features > 0:
             x_embedding += self.linear(x[:, self.num_categorical_features:self.num_categorical_features + self.num_scalar_features])
@@ -105,7 +102,7 @@ class TensorProductConvLayer(nn.Module):
         
         self.mlp = MLP(self.hidden_features, tp.weight_numel, self.dropout)  #TODO int: weight_numel = sum(prod(ins.path_shape) for ins in self.instructions if ins.has_weight)
         
-        self.batch_norm = BatchNorm(self.out_irreps) if self.batch_norm else None
+        self.batchNorm = BatchNorm(self.out_irreps) if self.batch_norm else None
         
     def forward(self, node_attr, edge_index, edge_attr, edge_sh, out_nodes=None, reduce='mean', training=False):
 
@@ -119,8 +116,8 @@ class TensorProductConvLayer(nn.Module):
             padded = jnp.pad(node_attr, ((0,0),(0, out.shape[-1] - node_attr.shape[-1])), mode='constant')
             out = out + padded
 
-        if self.batch_norm:
-            out = self.batch_norm(out)
+        if self.batchNorm:
+            out = self.batchNorm(out)
         return out
 
 
@@ -173,7 +170,7 @@ class DiffDock(nn.Module):
                 f'{self.ns}x0e',
                 f'{self.ns}x0e + {self.nv}x1o',
                 f'{self.ns}x0e + {self.nv}x1o + {self.nv}x1e',
-                f'{self.ns}x0e + {self.nv}x1o + {self.nvnv}x1e + {self.ns}x0o'
+                f'{self.ns}x0e + {self.nv}x1o + {self.nv}x1e + {self.ns}x0o'
             ]
 
         lig_conv_layers, rec_conv_layers, lig_to_rec_conv_layers, rec_to_lig_conv_layers = [], [], [], []
@@ -239,7 +236,7 @@ class DiffDock(nn.Module):
             
     def __call__(self, inputs, training):
         if not False:
-            tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(*[inputs.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']])
+            tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(*[inputs['complex_t'][noise_type] for noise_type in ['tr', 'rot', 'tor']])
         else:
             tr_sigma, rot_sigma, tor_sigma = [inputs.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']]
 
@@ -339,7 +336,7 @@ class DiffDock(nn.Module):
         # compute edges
         # Note: You need a JAX implementation of the radius_graph function.
         radius_edges = radius_graph(inputs['ligand'].pos, self.lig_max_radius, inputs['ligand'].batch)
-        edge_index = jnp.concatenate([inputs['ligand', 'ligand'].edge_index, radius_edges], axis=1)
+        edge_index = jnp.concatenate([inputs['ligand', 'ligand'].edge_index, radius_edges], axis=1).astype(jnp.int64)
         edge_attr = jnp.concatenate([
             inputs['ligand', 'ligand'].edge_attr,
             jnp.zeros((radius_edges.shape[-1], self.in_lig_edge_features))
@@ -347,12 +344,12 @@ class DiffDock(nn.Module):
 
         # compute initial features
         # Note: The index-based selection might need further adjustments in JAX.
-        edge_sigma_emb = inputs['ligand'].node_sigma_emb[edge_index[0]]
+        edge_sigma_emb = inputs['ligand'].node_sigma_emb[edge_index[0].astype(jnp.int64)]
         edge_attr = jnp.concatenate([edge_attr, edge_sigma_emb], axis=1)
         node_attr = jnp.concatenate([inputs['ligand'].x, inputs['ligand'].node_sigma_emb], axis=1)
 
         src, dst = edge_index
-        edge_vec = inputs['ligand'].pos[dst] - inputs['ligand'].pos[src]
+        edge_vec = inputs['ligand'].pos[dst.astype(jnp.int64)] - inputs['ligand'].pos[src.astype(jnp.int64)]
         
         # The following function `self.lig_distance_expansion` needs to be replaced or adapted for JAX.
         edge_length_emb = self.lig_distance_expansion(jnp.linalg.norm(edge_vec, axis=-1))
@@ -370,10 +367,10 @@ class DiffDock(nn.Module):
         # this assumes the edges were already created in preprocessing since protein's structure is fixed
         edge_index = inputs['receptor', 'receptor'].edge_index
         src, dst = edge_index
-        edge_vec = inputs['receptor'].pos[dst] - inputs['receptor'].pos[src]
+        edge_vec = inputs['receptor'].pos[dst.astype(jnp.int64)] - inputs['receptor'].pos[src.astype(jnp.int64)]
 
-        edge_length_emb = self.rec_distance_expansion(edge_vec.norm(dim=-1))
-        edge_sigma_emb = inputs['receptor'].node_sigma_emb[edge_index[0]]
+        edge_length_emb = self.rec_distance_expansion(jnp.linalg.norm(edge_vec, axis=-1))
+        edge_sigma_emb = inputs['receptor'].node_sigma_emb[edge_index[0].astype(jnp.int64)]
         edge_attr = jnp.concatenate([edge_sigma_emb, edge_length_emb], axis=1)
         edge_sh = e3nn.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
 
@@ -390,11 +387,11 @@ class DiffDock(nn.Module):
                                     inputs['receptor'].batch, inputs['ligand'].batch, max_num_neighbors=10000)
 
         src, dst = edge_index
-        edge_vec = inputs['receptor'].pos[dst] - inputs['ligand'].pos[src]
+        edge_vec = inputs['receptor'].pos[dst.astype(jnp.int64)] - inputs['ligand'].pos[src.astype(jnp.int64)]
         
         edge_length_emb = self.cross_distance_expansion(jnp.linalg.norm(edge_vec, axis=-1))
         
-        edge_sigma_emb = inputs['ligand'].node_sigma_emb[src]
+        edge_sigma_emb = inputs['ligand'].node_sigma_emb[src.astype(jnp.int64)]
         edge_attr = jnp.concatenate([edge_sigma_emb, edge_length_emb], axis=1)
         
         edge_sh = e3nn.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
@@ -415,7 +412,7 @@ class DiffDock(nn.Module):
 
         edge_vec = inputs['ligand'].pos[edge_index[1]] - center_pos[edge_index[0]]
         edge_attr = self.center_distance_expansion(jnp.linalg.norm(edge_vec, axis=-1))
-        edge_sigma_emb = inputs['ligand'].node_sigma_emb[edge_index[1]]
+        edge_sigma_emb = inputs['ligand'].node_sigma_emb[edge_index[1].astype(jnp.int64)]
         edge_attr = jnp.concatenate([edge_attr, edge_sigma_emb], axis=1)
         edge_sh = e3nn.spherical_harmonics(self.sh_irreps, edge_vec, normalize=True, normalization='component')
 
@@ -423,7 +420,7 @@ class DiffDock(nn.Module):
     
     def build_bond_conv_graph(self, inputs, training):
         # builds the graph for the convolution between the center of the rotatable bonds and the neighbouring nodes
-        bonds = inputs['ligand', 'ligand'].edge_index[:, inputs['ligand'].edge_mask]
+        bonds = inputs['ligand', 'ligand'].edge_index[:, inputs['ligand'].edge_mask].astype(jnp.int64)
         bond_pos = (inputs['ligand'].pos[bonds[0]] + inputs['ligand'].pos[bonds[1]]) / 2
         bond_batch = inputs['ligand'].batch[bonds[0]]
         edge_index = radius(inputs['ligand'].pos, bond_pos, self.lig_max_radius, batch_x=inputs['ligand'].batch, batch_y=bond_batch)
