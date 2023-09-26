@@ -42,7 +42,7 @@ def train(config):
       return model.init(params_key, batch, training=False)
     
     # jax.jit(init_model, backend='cpu')()
-    variables = jax.jit(init_model(batch=None), backend='cpu')()
+    variables = init_model()
     state, params = flax.core.pop(variables, 'params')
     del variables
     
@@ -70,7 +70,7 @@ def train(config):
       def train_step(x, opt_state, params, metric, dropout_key):
         def loss(params, inputs):
           _, new_dropout_key = jax.random.split(dropout_key)
-          tr_pred, rot_pred, tor_pred = apply_fn({'params': params, **state}, inputs, mutable=list(state.keys()), 
+          (tr_pred, rot_pred, tor_pred), state  = apply_fn({'params': params, **state}, inputs, mutable=list(state.keys()), 
                                                   training=True, rngs={'dropout': new_dropout_key})
           
           loss, tr_loss, rot_loss, tor_loss, tr_base_loss, rot_base_loss, tor_base_loss = loss_fn(tr_pred, rot_pred, tor_pred) 
@@ -80,7 +80,7 @@ def train(config):
         (l, metric, new_dropout_key), g = jax.value_and_grad(loss, has_aux=True)(params, x)
         updates, opt_state = tx.update(g, opt_state)
         params = optax.apply_updates(params, updates)
-        return opt_state, params, metric, new_dropout_key
+        return opt_state, params, metric, state, new_dropout_key
       return train_step
     
     update_fn = make_update_fn(apply_fn=model.apply, loss_fn=loss_fn, state=state, tx=tx)
@@ -88,12 +88,13 @@ def train(config):
     for epoch in tqdm(range(config.num_epochs)):
       metrics = Metrics(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss'])
       for step, batch in zip(tqdm(range(steps_per_epoch)), ds_train.as_numpy_iterator()):
-        opt_state, params, metric, dropout_key = update_fn(apply_fn, loss_fn, batch, opt_state, params, state, metric, dropout_key)
+        opt_state, params, metric, state, dropout_key = update_fn(apply_fn, loss_fn, batch, opt_state, params, state, metric, dropout_key)
         summary_writer.scalar('lr', step + epoch*steps_per_epoch, epoch)
         if ((config.checkpoint_every and step % config.eval_every == 0) or step == num_train_steps):
           checkpoint_path = flax_checkpoints.save_checkpoint(
               workdir, (params,opt_state, step), step)
           logging.info('Stored checkpoint at step %d to "%s"', step, checkpoint_path)
+          
       loss_dict = metrics.summary()
       summary_writer.scalar('loss', loss_dict['loss'], epoch)
       summary_writer.scalar('tr_loss', loss_dict['tr_loss'], epoch)

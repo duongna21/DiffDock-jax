@@ -7,21 +7,21 @@ from models.score_model import DiffDock
 from utils.diffusion_utils import get_timestep_embedding
 import optax
 from typing import Optional, Any, Callable
+from tqdm import tqdm
 
 def loss_function(tr_pred, rot_pred, tor_pred, data, t_to_sigma, tr_weight=1, rot_weight=1, tor_weight=1, apply_mean=True, no_torsion=False):
-    tr_sigma, rot_sigma, tor_sigma = t_to_sigma(
-        *[jnp.concatenate([d.complex_t[noise_type] for d in data])
-          for noise_type in ['tr', 'rot', 'tor']])
+    tr_sigma, rot_sigma, tor_sigma = t_to_sigma(*[jnp.concatenate([d.complex_t[noise_type] for d in data])
+                                                for noise_type in ['tr', 'rot', 'tor']])
     mean_dims = (0, 1) if apply_mean else 1
 
     # translation component
-    tr_score = jnp.concatenate([d.tr_score for d in data])
+    tr_score = jnp.concatenate([d.tr_score for d in data], axis=0)
     tr_sigma = tr_sigma[:, None]
     tr_loss = jnp.mean(((tr_pred - tr_score) ** 2 * tr_sigma ** 2), axis=mean_dims)
     tr_base_loss = jnp.mean((tr_score ** 2 * tr_sigma ** 2),axis=mean_dims)
 
     # rotation component
-    rot_score = jnp.concatenate([d.rot_score for d in data])
+    rot_score = jnp.concatenate([d.rot_score for d in data], axis=0)
     rot_score_norm = so3.score_norm(rot_sigma)[:, None]
     rot_loss = jnp.mean((((rot_pred - rot_score) / rot_score_norm) ** 2),axis=mean_dims)
     rot_base_loss = jnp.mean(((rot_score / rot_score_norm) ** 2),axis=mean_dims)
@@ -29,7 +29,7 @@ def loss_function(tr_pred, rot_pred, tor_pred, data, t_to_sigma, tr_weight=1, ro
     # torsion component
     if not no_torsion:
         edge_tor_sigma = jnp.concatenate([d.tor_sigma_edge for d in data])
-        tor_score = jnp.concatenate([d.tor_score for d in data])
+        tor_score = jnp.concatenate([d.tor_score for d in data], axis=0)
         tor_score_norm2 = torus.score_norm(edge_tor_sigma)
         tor_loss = ((tor_pred - tor_score) ** 2 / tor_score_norm2)
         tor_base_loss = ((tor_score ** 2 / tor_score_norm2))
@@ -158,3 +158,38 @@ class Metrics():
                 for type_idx, k in enumerate(self.types):
                     out['int' + str(i) + '_' + k] = list(self.acc.values())[type_idx][i] / self.count[type_idx][i]
             return out
+
+
+
+def test_epoch(model, loader, device, t_to_sigma, loss_fn, state, params, test_sigma_intervals=False):
+    meter = Metrics(['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
+                         unpooled_metrics=True)
+
+    if test_sigma_intervals:
+        meter_all = Metrics(
+            ['loss', 'tr_loss', 'rot_loss', 'tor_loss', 'tr_base_loss', 'rot_base_loss', 'tor_base_loss'],
+            unpooled_metrics=True, intervals=10)
+
+    for data in tqdm(loader, total=len(loader)):
+        (tr_pred, rot_pred, tor_pred), _ = model.apply({'params': params, **state}, data, mutable=['batch_stats'], training=False)
+
+        loss, tr_loss, rot_loss, tor_loss, tr_base_loss, rot_base_loss, tor_base_loss = \
+            loss_fn(tr_pred, rot_pred, tor_pred, data=data, t_to_sigma=t_to_sigma, apply_mean=False, device=device)
+        meter.add([loss, tr_loss, rot_loss, tor_loss, tr_base_loss, rot_base_loss, tor_base_loss])
+
+        if test_sigma_intervals > 0:
+            complex_t_tr, complex_t_rot, complex_t_tor = [jnp.concatenate([d.complex_t[noise_type] for d in data]) for
+                                                            noise_type in ['tr', 'rot', 'tor']]
+            sigma_index_tr = jnp.round(complex_t_tr * (10 - 1)).astype(jnp.int32)
+            sigma_index_rot = jnp.round(complex_t_rot * (10 - 1)).astype(jnp.int32)
+            sigma_index_tor = jnp.round(complex_t_tor * (10 - 1)).astype(jnp.int32)
+            meter_all.add(
+                [loss, tr_loss, rot_loss, tor_loss, tr_base_loss, rot_base_loss, tor_base_loss],
+                [sigma_index_tr, sigma_index_tr, sigma_index_rot, sigma_index_tor, sigma_index_tr, sigma_index_rot,
+                    sigma_index_tor, sigma_index_tr])
+
+    out = meter.summary()
+    if test_sigma_intervals > 0: 
+        out.update(meter_all.summary())
+        
+    return out
