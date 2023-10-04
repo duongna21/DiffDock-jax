@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 import jax.numpy as jnp
-from utils.torsion import modify_conformer_torsion_angles_jax
+from utils.torsion_torch import modify_conformer_torsion_angles_jax
 
 def modify_conformer_torsion_angles(pos, edge_index, mask_rotate, torsion_updates, as_numpy=False):
     pos = copy.deepcopy(pos)

@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 import numpy as np
-from utils.torsion import modify_conformer_torsion_angles
+from utils.torsion_torch import modify_conformer_torsion_angles
 import jax
 from jax.scipy.spatial.transform import Rotation as R
 from utils.diffusion_utils import modify_conformer, set_time

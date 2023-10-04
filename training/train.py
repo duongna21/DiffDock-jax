@@ -11,9 +11,11 @@ from tqdm import tqdm
 from flax.training import train_state, checkpoints as flax_checkpoints
 from flax.metrics import tensorboard
 from absl import logging
+from utils.parsing import parse_train_args
 
 
-def train(config):
+def train():
+    config = parse_train_args()
     
     #TODO data
     ds_train = None
@@ -101,3 +103,6 @@ def train(config):
       summary_writer.scalar('rot_loss', loss_dict['rot_loss'], epoch)
       summary_writer.scalar('tor_loss', loss_dict['tor_loss'], epoch)
       
+      
+if __name__ == '__main__':
+    train()

@@ -1,7 +1,7 @@
 import jax.numpy as jnp
 from jax.scipy.spatial.transform import Rotation as R
-from utils.geometry import rigid_transform_Kabsch_3D_jax, axis_angle_to_matrix_jax
-from utils.torsion import modify_conformer_torsion_angles
+from utils.geometry import rigid_transform_Kabsch_3D_jax, axis_angle_to_matrix
+from utils.torsion_torch import modify_conformer_torsion_angles
 from flax import linen as nn
 
 
@@ -14,7 +14,7 @@ def t_to_sigma(t_tr, t_rot, t_tor, args):
 
 def modify_conformer(data, tr_update, rot_update, torsion_updates):
     lig_center = jnp.mean(data['ligand'].pos, axis=0, keepdims=True)
-    rot_mat = axis_angle_to_matrix_jax(rot_update.squeeze())
+    rot_mat = axis_angle_to_matrix(rot_update.squeeze())
     rigid_new_pos = jnp.matmul(data['ligand'].pos - lig_center, rot_mat.T) + tr_update + lig_center
 
     if torsion_updates is not None:
@@ -67,8 +67,6 @@ def get_t_schedule(inference_steps):
     return jnp.linspace(1, 0, inference_steps + 1)[:-1]
 
 def set_time(complex_graphs, t_tr, t_rot, t_tor, batchsize, all_atoms):
-    # Note: You might need to adjust the way 'device' is handled in JAX, depending on your setup.
-    # I'm skipping the device here, as JAX handles device placement differently.
     complex_graphs['ligand'].node_t = {
         'tr': t_tr * jnp.ones(complex_graphs['ligand'].num_nodes),
         'rot': t_rot * jnp.ones(complex_graphs['ligand'].num_nodes),

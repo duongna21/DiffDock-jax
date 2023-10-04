@@ -1,6 +1,4 @@
-import math
 from typing import Optional, Any, Callable
-
 import e3nn_jax as e3nn
 import jax
 import flax.linen as nn
@@ -9,11 +7,9 @@ from utils.scatter import scatter
 import numpy as np
 import jax.numpy as jnp
 from models.batchnorm_flax import BatchNorm
-from models.f_tp_flax import FullTensorProduct
-from models.fc_tp_flax import FullyConnectedTensorProduct
-from utils import so3, torus
+from utils import torus, so3
 from datasets.process_mols import lig_feature_dims, rec_residue_feature_dims
-
+from models.linear import FunctionalLinear
 
 class GaussianSmearing(nn.Module):
     start: float = 0.0
@@ -27,7 +23,6 @@ class GaussianSmearing(nn.Module):
     def __call__(self, dist):
         dist = dist.reshape((-1, 1)) - self.offset.reshape((1, -1))
         return jnp.exp(self.coeff * jnp.power(dist, 2))
-
 
 class MLP(nn.Module):
 
@@ -95,20 +90,24 @@ class TensorProductConvLayer(nn.Module):
 
     def setup(self):
         if self.hidden_features is None:
-            hidden_features = self.n_edge_features
+            hidden_size = self.n_edge_features
 
-        self.tp = tp = FullyConnectedTensorProduct(self.out_irreps, self.in_irreps, self.sh_irreps)
-
+        self.tp = tp = FunctionalLinear(e3nn.tensor_product(self.in_irreps, self.sh_irreps), self.out_irreps)
+        self.fc = MLP(self.hidden_features if self.hidden_features is not None else hidden_size, tp.num_weights())
         self.batchNorm = BatchNorm(self.out_irreps) if self.batch_norm else None
 
-    def __call__(self, node_attr, edge_index, edge_attr, edge_sh, out_nodes=None, rd='mean', training=False):
+    def __call__(self, node_attr, edge_index, edge_attr, edge_sh, out_nodes=None, reduce='mean', training=False):
 
         edge_src, edge_dst = edge_index
 
-        tp = self.tp(node_attr[edge_dst], edge_sh)
+        dense = self.fc(edge_attr, training)
+        node_attr_edge_dst = e3nn.IrrepsArray(self.in_irreps, node_attr[edge_dst])
+        tensor_prod = e3nn.tensor_product(node_attr_edge_dst, edge_sh)
+
+        tp = self.tp(dense, tensor_prod)
 
         out_nodes = out_nodes or node_attr.shape[0]
-        out = scatter(tp.array, edge_src, dim=0, dim_size=out_nodes, rd=rd)
+        out = scatter(tp.array, edge_src, dim=0, dim_size=out_nodes, reduce=reduce)
 
         if self.residual:
             padded = jnp.pad(node_attr, ((0,0),(0, out.shape[-1] - node_attr.shape[-1])), mode='constant')
@@ -142,8 +141,6 @@ class DiffDock(nn.Module):
     dynamic_max_cross: bool = False
     dropout: float = 0.0
     lm_embedding_type: str = None
-    confidence_dropout: float = 0.0
-    confidence_no_batchnorm: bool = False
 
     def setup(self):
         self.sh_irreps = e3nn.Irreps.spherical_harmonics(lmax=self.sh_lmax)
@@ -220,12 +217,10 @@ class DiffDock(nn.Module):
         if not self.no_torsion:
             # torsion angles components
             self.final_edge_embedding = MLP(self.ns, self.ns, self.dropout)
-            # self.final_tp_tor = FullTensorProduct(self.sh_irreps, "2e", '1x0e + 1x1o + 1x1e + 1x2o + 2x2e + 1x3o + 1x3e + 1x4e')
-
+            final_tp_tor = e3nn.tensor_product(self.sh_irreps, "2e")
             self.tor_bond_conv = TensorProductConvLayer(
                 in_irreps=self.lig_conv_layers[-1].out_irreps,
-                # sh_irreps=self.final_tp_tor.irreps_out,
-                sh_irreps='1x0e+1x1o+1x1e+2x2e+1x2o+1x3o+1x3e+1x4e',
+                sh_irreps=final_tp_tor,
                 out_irreps=f'{self.ns}x0o + {self.ns}x0e',
                 n_edge_features=3 * self.ns,
                 residual=False,
@@ -236,10 +231,8 @@ class DiffDock(nn.Module):
             self.tor_final_layer = MLP(self.ns, 1, self.dropout, False)
 
     def __call__(self, inputs, training):
-        if not False:
-            tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(*[inputs['complex_t'][noise_type] for noise_type in ['tr', 'rot', 'tor']])
-        else:
-            tr_sigma, rot_sigma, tor_sigma = [inputs.complex_t[noise_type] for noise_type in ['tr', 'rot', 'tor']]
+
+        tr_sigma, rot_sigma, tor_sigma = self.t_to_sigma(*[inputs['complex_t'][noise_type] for noise_type in ['tr', 'rot', 'tor']])
 
         # build ligand graph
         lig_node_attr, lig_edge_index, lig_edge_attr, lig_edge_sh = self.build_lig_conv_graph(inputs)
@@ -269,7 +262,6 @@ class DiffDock(nn.Module):
             rec_to_lig_edge_attr_ = jnp.concatenate([cross_edge_attr, lig_node_attr[cross_lig, :self.ns], rec_node_attr[cross_rec, :self.ns]], axis=-1)
             lig_inter_update = self.rec_to_lig_conv_layers[l](rec_node_attr, cross_edge_index, rec_to_lig_edge_attr_, cross_edge_sh,
                                                               out_nodes=lig_node_attr.shape[0])
-
             if l != len(self.lig_conv_layers) - 1:
                 rec_edge_attr_ = jnp.concatenate([rec_edge_attr, rec_node_attr[rec_src, :self.ns], rec_node_attr[rec_dst, :self.ns]], -1)
                 rec_intra_update = self.rec_conv_layers[l](rec_node_attr, rec_edge_index, rec_edge_attr_, rec_edge_sh)
@@ -317,10 +309,11 @@ class DiffDock(nn.Module):
 
         tor_bonds_sh = e3nn.spherical_harmonics("2e", tor_bond_vec, normalize=True, normalization='component')
         tor_edge_sh.irreps = self.sh_irreps
+
         tor_edge_sh = e3nn.tensor_product(tor_edge_sh, tor_bonds_sh[tor_edge_index[0]]) #self.sh_irreps, "2e"
 
         tor_edge_attr = jnp.concatenate([tor_edge_attr, lig_node_attr[tor_edge_index[1], :self.ns], tor_bond_attr[tor_edge_index[0], :self.ns]], -1)
-        tor_pred = self.tor_bond_conv(lig_node_attr, tor_edge_index, tor_edge_attr, tor_edge_sh, out_nodes=jnp.sum(inputs['ligand'].edge_mask), rd='mean')
+        tor_pred = self.tor_bond_conv(lig_node_attr, tor_edge_index, tor_edge_attr, tor_edge_sh, out_nodes=jnp.sum(inputs['ligand'].edge_mask), reduce='mean')
         tor_pred = self.tor_final_layer(tor_pred.array, training).squeeze(1)
 
         edge_sigma = tor_sigma[inputs['ligand'].batch][inputs['ligand_lig_bond_ligand'].edge_index[0]][inputs['ligand'].edge_mask]
