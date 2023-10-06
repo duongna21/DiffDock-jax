@@ -4,6 +4,7 @@ import warnings
 
 import numpy as np
 import scipy.spatial as spa
+import torch
 from Bio.PDB import PDBParser
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
 from rdkit import Chem
@@ -12,7 +13,10 @@ from rdkit.Chem import AllChem, GetPeriodicTable, RemoveHs
 from rdkit.Geometry import Point3D
 from scipy import spatial
 from scipy.special import softmax
-from utils.radius import radius_graph
+from torch_cluster import radius_graph
+
+
+import torch.nn.functional as F
 
 from datasets.conformer_matching import get_torsion_angles, optimize_rotatable_bonds
 from utils.torsion_torch import get_transformation_mask
@@ -109,14 +113,14 @@ def lig_atom_featurizer(mol):
             allowable_features['possible_is_in_ring8_list'].index(ringinfo.IsAtomInRingOfSize(idx, 8)),
         ])
 
-    return np.array(atom_features_list)
+    return torch.tensor(atom_features_list)
 
 
 def rec_residue_featurizer(rec):
     feature_list = []
     for residue in rec.get_residues():
         feature_list.append([safe_index(allowable_features['possible_amino_acids'], residue.get_resname())])
-    return np.array(feature_list, dtype=np.float32)  # (N_res, 1)
+    return torch.tensor(feature_list, dtype=torch.float32)  # (N_res, 1)
 
 
 def safe_index(l, e):
@@ -242,7 +246,7 @@ def extract_receptor_structure(rec, lig, lm_embedding_chains=None):
 
 
 def get_lig_graph(mol, complex_graph):
-    lig_coords = mol.GetConformer().GetPositions().astype(np.float32)
+    lig_coords = torch.from_numpy(mol.GetConformer().GetPositions()).float()
     atom_feats = lig_atom_featurizer(mol)
 
     row, col, edge_type = [], [], []
@@ -252,10 +256,9 @@ def get_lig_graph(mol, complex_graph):
         col += [end, start]
         edge_type += 2 * [bonds[bond.GetBondType()]] if bond.GetBondType() != BT.UNSPECIFIED else [0, 0]
 
-    edge_index = np.array([row, col], dtype=np.int32)
-    edge_type = np.array(edge_type, dtype=np.int32)
-    # edge_attr = F.one_hot(edge_type, num_classes=len(bonds)).to(torch.float)
-    edge_attr = np.eye(len(bonds))[edge_type].astype(np.float32)
+    edge_index = torch.tensor([row, col], dtype=torch.long)
+    edge_type = torch.tensor(edge_type, dtype=torch.long)
+    edge_attr = F.one_hot(edge_type, num_classes=len(bonds)).to(torch.float)
 
     complex_graph['ligand'].x = atom_feats
     complex_graph['ligand'].pos = lig_coords
@@ -271,6 +274,8 @@ def generate_conformer(mol):
         ps.useRandomCoords = True
         AllChem.EmbedMolecule(mol, ps)
         AllChem.MMFFOptimizeMolecule(mol, confId=0)
+    # else:
+    #    AllChem.MMFFOptimizeMolecule(mol_rdkit, confId=0)
 
 def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching, keep_original, num_conformers, remove_hs):
     if matching:
@@ -304,9 +309,9 @@ def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching,
                 complex_graph.rmsd_matching = rms_list[0]
                 get_lig_graph(mol_rdkit, complex_graph)
             else:
-                if isinstance(complex_graph['ligand'].pos, np.ndarray):
+                if torch.is_tensor(complex_graph['ligand'].pos):
                     complex_graph['ligand'].pos = [complex_graph['ligand'].pos]
-                complex_graph['ligand'].pos.append(mol_rdkit.GetConformer().GetPositions().astype(np.float32))
+                complex_graph['ligand'].pos.append(torch.from_numpy(mol_rdkit.GetConformer().GetPositions()).float())
 
     else:  # no matching
         complex_graph.rmsd_matching = 0
@@ -314,7 +319,7 @@ def get_lig_graph_with_matching(mol_, complex_graph, popsize, maxiter, matching,
         get_lig_graph(mol_, complex_graph)
 
     edge_mask, mask_rotate = get_transformation_mask(complex_graph)
-    complex_graph['ligand'].edge_mask = np.array(edge_mask)
+    complex_graph['ligand'].edge_mask = torch.tensor(edge_mask)
     complex_graph['ligand'].mask_rotate = mask_rotate
 
     return
@@ -358,14 +363,15 @@ def get_calpha_graph(rec, c_alpha_coords, n_coords, c_coords, complex_graph, cut
     assert len(src_list) == len(dst_list)
 
     node_feat = rec_residue_featurizer(rec)
-    mu_r_norm = np.array(mean_norm_list).astype(np.float32)
-    side_chain_vecs = np.concatenate([np.expand_dims(n_rel_pos, axis=1), np.expand_dims(c_rel_pos, axis=1)], axis=1)
+    mu_r_norm = torch.from_numpy(np.array(mean_norm_list).astype(np.float32))
+    side_chain_vecs = torch.from_numpy(
+        np.concatenate([np.expand_dims(n_rel_pos, axis=1), np.expand_dims(c_rel_pos, axis=1)], axis=1))
 
-    complex_graph['receptor'].x = np.concatenate([node_feat, np.array(lm_embeddings)], axis=1) if lm_embeddings is not None else node_feat
-    complex_graph['receptor'].pos = c_alpha_coords.astype(np.float32)
+    complex_graph['receptor'].x = torch.cat([node_feat, torch.tensor(lm_embeddings)], axis=1) if lm_embeddings is not None else node_feat
+    complex_graph['receptor'].pos = torch.from_numpy(c_alpha_coords).float()
     complex_graph['receptor'].mu_r_norm = mu_r_norm
-    complex_graph['receptor'].side_chain_vecs = side_chain_vecs.astype(np.float32)
-    complex_graph['receptor', 'rec_contact', 'receptor'].edge_index = np.asarray([src_list, dst_list])
+    complex_graph['receptor'].side_chain_vecs = side_chain_vecs.float()
+    complex_graph['receptor', 'rec_contact', 'receptor'].edge_index = torch.from_numpy(np.asarray([src_list, dst_list]))
 
     return
 
@@ -392,9 +398,84 @@ def rec_atom_featurizer(rec):
 
 def get_rec_graph(rec, rec_coords, c_alpha_coords, n_coords, c_coords, complex_graph, rec_radius, c_alpha_max_neighbors=None, all_atoms=False,
                   atom_radius=5, atom_max_neighbors=None, remove_hs=False, lm_embeddings=None):
+    if all_atoms:
+        return get_fullrec_graph(rec, rec_coords, c_alpha_coords, n_coords, c_coords, complex_graph,
+                                 c_alpha_cutoff=rec_radius, c_alpha_max_neighbors=c_alpha_max_neighbors,
+                                 atom_cutoff=atom_radius, atom_max_neighbors=atom_max_neighbors, remove_hs=remove_hs,lm_embeddings=lm_embeddings)
+    else:
+        return get_calpha_graph(rec, c_alpha_coords, n_coords, c_coords, complex_graph, rec_radius, c_alpha_max_neighbors,lm_embeddings=lm_embeddings)
 
-    return get_calpha_graph(rec, c_alpha_coords, n_coords, c_coords, complex_graph, rec_radius, c_alpha_max_neighbors,lm_embeddings=lm_embeddings)
-  
+
+def get_fullrec_graph(rec, rec_coords, c_alpha_coords, n_coords, c_coords, complex_graph, c_alpha_cutoff=20,
+                      c_alpha_max_neighbors=None, atom_cutoff=5, atom_max_neighbors=None, remove_hs=False, lm_embeddings=None):
+    # builds the receptor graph with both residues and atoms
+
+    n_rel_pos = n_coords - c_alpha_coords
+    c_rel_pos = c_coords - c_alpha_coords
+    num_residues = len(c_alpha_coords)
+    if num_residues <= 1:
+        raise ValueError(f"rec contains only 1 residue!")
+
+    # Build the k-NN graph of residues
+    distances = spa.distance.cdist(c_alpha_coords, c_alpha_coords)
+    src_list = []
+    dst_list = []
+    mean_norm_list = []
+    for i in range(num_residues):
+        dst = list(np.where(distances[i, :] < c_alpha_cutoff)[0])
+        dst.remove(i)
+        if c_alpha_max_neighbors != None and len(dst) > c_alpha_max_neighbors:
+            dst = list(np.argsort(distances[i, :]))[1: c_alpha_max_neighbors + 1]
+        if len(dst) == 0:
+            dst = list(np.argsort(distances[i, :]))[1:2]  # choose second because first is i itself
+            print(f'The c_alpha_cutoff {c_alpha_cutoff} was too small for one c_alpha such that it had no neighbors. '
+                  f'So we connected it to the closest other c_alpha')
+        assert i not in dst
+        src = [i] * len(dst)
+        src_list.extend(src)
+        dst_list.extend(dst)
+        valid_dist = list(distances[i, dst])
+        valid_dist_np = distances[i, dst]
+        sigma = np.array([1., 2., 5., 10., 30.]).reshape((-1, 1))
+        weights = softmax(- valid_dist_np.reshape((1, -1)) ** 2 / sigma, axis=1)  # (sigma_num, neigh_num)
+        assert 1 - 1e-2 < weights[0].sum() < 1.01
+        diff_vecs = c_alpha_coords[src, :] - c_alpha_coords[dst, :]  # (neigh_num, 3)
+        mean_vec = weights.dot(diff_vecs)  # (sigma_num, 3)
+        denominator = weights.dot(np.linalg.norm(diff_vecs, axis=1))  # (sigma_num,)
+        mean_vec_ratio_norm = np.linalg.norm(mean_vec, axis=1) / denominator  # (sigma_num,)
+        mean_norm_list.append(mean_vec_ratio_norm)
+    assert len(src_list) == len(dst_list)
+
+    node_feat = rec_residue_featurizer(rec)
+    mu_r_norm = torch.from_numpy(np.array(mean_norm_list).astype(np.float32))
+    side_chain_vecs = torch.from_numpy(
+        np.concatenate([np.expand_dims(n_rel_pos, axis=1), np.expand_dims(c_rel_pos, axis=1)], axis=1))
+
+    complex_graph['receptor'].x = torch.cat([node_feat, torch.tensor(lm_embeddings)], axis=1) if lm_embeddings is not None else node_feat
+    complex_graph['receptor'].pos = torch.from_numpy(c_alpha_coords).float()
+    complex_graph['receptor'].mu_r_norm = mu_r_norm
+    complex_graph['receptor'].side_chain_vecs = side_chain_vecs.float()
+    complex_graph['receptor', 'rec_contact', 'receptor'].edge_index = torch.from_numpy(np.asarray([src_list, dst_list]))
+
+    src_c_alpha_idx = np.concatenate([np.asarray([i]*len(l)) for i, l in enumerate(rec_coords)])
+    atom_feat = torch.from_numpy(np.asarray(rec_atom_featurizer(rec)))
+    atom_coords = torch.from_numpy(np.concatenate(rec_coords, axis=0)).float()
+
+    if remove_hs:
+        not_hs = (atom_feat[:, 1] != 0)
+        src_c_alpha_idx = src_c_alpha_idx[not_hs]
+        atom_feat = atom_feat[not_hs]
+        atom_coords = atom_coords[not_hs]
+
+    atoms_edge_index = radius_graph(atom_coords, atom_cutoff, max_num_neighbors=atom_max_neighbors if atom_max_neighbors else 1000)
+    atom_res_edge_index = torch.from_numpy(np.asarray([np.arange(len(atom_feat)), src_c_alpha_idx])).long()
+
+    complex_graph['atom'].x = atom_feat
+    complex_graph['atom'].pos = atom_coords
+    complex_graph['atom', 'atom_contact', 'atom'].edge_index = atoms_edge_index
+    complex_graph['atom', 'atom_rec_contact', 'receptor'].edge_index = atom_res_edge_index
+
+    return
 
 def write_mol_with_coords(mol, new_coords, path):
     w = Chem.SDWriter(path)
